@@ -152,6 +152,75 @@ fn using_multiple_wakers_panics_different_cloned_registries() {
     drop(waker2);
 }
 
+/// Regression test: registering or deregistering an fd while another thread
+/// calls `Waker::wake` must not swallow the wakeup. The `poll(2)` selector
+/// shares one notify pipe between both and used to drain the waker's byte.
+#[test]
+#[cfg(unix)]
+fn waker_wakeup_concurrent_with_registration() {
+    use mio::unix::SourceFd;
+    use mio::Interest;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    init();
+
+    let mut poll = Poll::new().expect("unable to create new Poll instance");
+    let mut events = Events::with_capacity(10);
+
+    let token = Token(10);
+    let waker = Arc::new(Waker::new(poll.registry(), token).expect("unable to create waker"));
+    let registry = poll.registry().try_clone().unwrap();
+    let (stream, _peer) = UnixStream::pair().unwrap();
+
+    const ROUNDS: usize = 1000;
+    // Main thread, waker thread and registering thread.
+    let start = Arc::new(Barrier::new(3));
+    let done = Arc::new(Barrier::new(3));
+
+    let handle1 = {
+        let (start, done, waker) = (start.clone(), done.clone(), waker.clone());
+        thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                start.wait();
+                waker.wake().expect("unable to wake");
+                done.wait();
+            }
+        })
+    };
+    let handle2 = {
+        let (start, done) = (start.clone(), done.clone());
+        thread::spawn(move || {
+            let fd = stream.as_raw_fd();
+            for _ in 0..ROUNDS {
+                start.wait();
+                registry
+                    .register(&mut SourceFd(&fd), Token(20), Interest::READABLE)
+                    .expect("unable to register");
+                registry
+                    .deregister(&mut SourceFd(&fd))
+                    .expect("unable to deregister");
+                done.wait();
+            }
+        })
+    };
+
+    for round in 0..ROUNDS {
+        start.wait();
+        done.wait();
+        // Every wake must be delivered; with the race it never shows up.
+        let mut woken = false;
+        while !woken {
+            poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
+            assert!(!events.is_empty(), "lost wakeup in round {round}");
+            woken = events.iter().any(|event| event.token() == token);
+        }
+    }
+
+    handle1.join().unwrap();
+    handle2.join().unwrap();
+}
+
 fn expect_waker_event(poll: &mut Poll, events: &mut Events, token: Token) {
     poll.poll(events, Some(Duration::from_millis(100))).unwrap();
     assert!(!events.is_empty());

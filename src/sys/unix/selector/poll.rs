@@ -238,13 +238,16 @@ impl SelectorState {
                 num_fd_events = num_events;
             };
 
-            let pending_wake_token = self.pending_wake_token.lock().unwrap().take();
-
+            // Drain the pipe *before* taking the wake token: a `wake()` landing in
+            // between then leaves its byte in the pipe instead of being lost.
             if notified {
                 self.notify_waker.ack_and_reset();
-                if pending_wake_token.is_some() {
-                    num_fd_events += 1;
-                }
+            }
+
+            let pending_wake_token = self.pending_wake_token.lock().unwrap().take();
+
+            if notified && pending_wake_token.is_some() {
+                num_fd_events += 1;
             }
 
             // We now check whether this poll was performed with descriptors which were pending
@@ -407,6 +410,11 @@ impl SelectorState {
         // If there was no caller of `wait` our notification was not removed from the pipe.
         if sent_notification {
             self.notify_waker.ack_and_reset();
+            // Draining may also have swallowed the byte of a concurrent `wake()`;
+            // re-arm the pipe so that wakeup is not lost.
+            if self.pending_wake_token.lock().unwrap().is_some() {
+                let _ = self.notify_waker.wake();
+            }
         }
 
         let res = f(&mut *fds);
